@@ -1,0 +1,587 @@
+// ============================================================================
+// IoT Lab — Prisma Schema
+// Multi-tenant (per-university) relational schema for the IoT Lab platform.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Identity & tenancy
+// ----------------------------------------------------------------------------
+
+enum Role {
+  STUDENT
+  INSTRUCTOR
+  UNIVERSITY_ADMIN
+  PLATFORM_ADMIN
+}
+
+model University {
+  id           String   @id @default(cuid())
+  name         String
+  slug         String   @unique
+  status       UniversityStatus @default(ACTIVE)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  departments  Department[]
+  users        User[]
+  courses      Course[]
+  devices      Device[]
+  subscription Subscription?
+  auditLogs    AuditLog[]
+
+  @@index([slug])
+}
+
+enum UniversityStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+}
+
+model Department {
+  id           String   @id @default(cuid())
+  name         String
+  universityId String
+  university   University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  courses      Course[]
+  createdAt    DateTime @default(now())
+
+  @@index([universityId])
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String
+  firstName     String
+  lastName      String
+  role          Role
+  universityId  String?
+  university    University? @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Student-side relations
+  enrollments        Enrollment[]
+  submissions        Submission[]
+  projects           Project[]
+  reservations        DeviceReservation[]
+  dashboards          Dashboard[]
+
+  // Instructor-side relations
+  coursesTaught       Course[]      @relation("InstructorCourses")
+  experimentsCreated  Experiment[]  @relation("InstructorExperiments")
+  gradesGiven         Grade[]       @relation("GraderUser")
+
+  auditLogs           AuditLog[]
+
+  // Commerce
+  addresses           Address[]
+  orders              Order[]
+  rentals             Rental[]
+
+  @@index([universityId])
+  @@index([role])
+}
+
+// ----------------------------------------------------------------------------
+// Academics
+// ----------------------------------------------------------------------------
+
+model Course {
+  id            String   @id @default(cuid())
+  name          String
+  description   String
+  difficulty    String   // Beginner | Intermediate | Advanced
+  durationWeeks Int      @default(8)
+
+  universityId  String
+  university    University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+
+  departmentId  String?
+  department    Department? @relation(fields: [departmentId], references: [id])
+
+  instructorId  String
+  instructor    User @relation("InstructorCourses", fields: [instructorId], references: [id])
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  enrollments   Enrollment[]
+  experiments   Experiment[]
+  assignments   Assignment[]
+  products      Product[]
+
+  @@index([universityId])
+  @@index([instructorId])
+}
+
+model Enrollment {
+  id         String   @id @default(cuid())
+  studentId  String
+  student    User     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  courseId   String
+  course     Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  progress   Int      @default(0) // percentage 0-100
+  enrolledAt DateTime @default(now())
+
+  @@unique([studentId, courseId])
+  @@index([courseId])
+}
+
+model Experiment {
+  id                 String   @id @default(cuid())
+  name               String
+  description        String
+  learningObjectives String
+  componentsRequired String[] // e.g. ["ESP32", "TEMP_SENSOR", "LED"]
+  instructions        String
+  starterCode         String?
+  expectedResult      String?
+  timeLimitMinutes    Int?
+
+  courseId    String
+  course      Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  instructorId String
+  instructor   User @relation("InstructorExperiments", fields: [instructorId], references: [id])
+
+  createdAt   DateTime @default(now())
+
+  assignments Assignment[]
+  submissions Submission[]
+
+  @@index([courseId])
+}
+
+model Assignment {
+  id           String   @id @default(cuid())
+  title        String
+  instructions String
+  deadline     DateTime
+  requiredComponents String[]
+  gradingCriteria    Json     // e.g. [{ "label": "Sensor connected", "points": 20 }, ...]
+  maxScore           Int      @default(100)
+
+  courseId     String
+  course       Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  experimentId String?
+  experiment   Experiment? @relation(fields: [experimentId], references: [id])
+
+  createdAt    DateTime @default(now())
+
+  submissions  Submission[]
+
+  @@index([courseId])
+}
+
+model Submission {
+  id           String   @id @default(cuid())
+  studentId    String
+  student      User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  assignmentId String
+  assignment   Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+
+  experimentId String?
+  experiment   Experiment? @relation(fields: [experimentId], references: [id])
+
+  code         String?
+  circuitJson  Json?    // serialized virtual-lab circuit graph
+  status       SubmissionStatus @default(SUBMITTED)
+  submittedAt  DateTime @default(now())
+
+  grade        Grade?
+
+  @@index([assignmentId])
+  @@index([studentId])
+}
+
+enum SubmissionStatus {
+  DRAFT
+  SUBMITTED
+  GRADED
+  RETURNED
+}
+
+model Grade {
+  id           String   @id @default(cuid())
+  submissionId String   @unique
+  submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  score        Int
+  maxScore     Int
+  breakdown    Json     // rule-based grading breakdown
+  feedback     String?
+
+  gradedById   String
+  gradedBy     User @relation("GraderUser", fields: [gradedById], references: [id])
+  gradedAt     DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// Project portfolio
+// ----------------------------------------------------------------------------
+
+enum ProjectVisibility {
+  PRIVATE
+  COURSE_ONLY
+  PUBLIC
+}
+
+model Project {
+  id           String   @id @default(cuid())
+  studentId    String
+  student      User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  name         String
+  description  String
+  components   String[]
+  sourceCode   String?
+  circuitJson  Json?
+  sensorData   Json?
+  results      String?
+  documentation String?
+  visibility   ProjectVisibility @default(PRIVATE)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([studentId])
+}
+
+// ----------------------------------------------------------------------------
+// Dashboards (student-configurable IoT dashboards)
+// ----------------------------------------------------------------------------
+
+model Dashboard {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime @default(now())
+
+  widgets   DashboardWidget[]
+}
+
+model DashboardWidget {
+  id          String   @id @default(cuid())
+  dashboardId String
+  dashboard   Dashboard @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+  type        String   // LINE_CHART | BAR_CHART | GAUGE | STATUS
+  metric      String   // temperature | humidity | light | motion | device_status
+  config      Json?
+  position    Int      @default(0)
+}
+
+// ----------------------------------------------------------------------------
+// Simulation (virtual lab)
+// ----------------------------------------------------------------------------
+
+model Simulation {
+  id          String   @id @default(cuid())
+  ownerId     String   // userId of the student who owns it (not a hard FK to keep light)
+  name        String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  components  SimulationComponent[]
+  connections SimulationConnection[]
+}
+
+model SimulationComponent {
+  id           String   @id @default(cuid())
+  simulationId String
+  simulation   Simulation @relation(fields: [simulationId], references: [id], onDelete: Cascade)
+  type         String   // ESP32 | LED | BUTTON | TEMP_SENSOR | HUMIDITY_SENSOR | LIGHT_SENSOR | PIR | ULTRASONIC | SERVO | RELAY | OLED | BUZZER
+  label        String
+  x            Float
+  y            Float
+  config       Json?    // e.g. { "pin": 5, "threshold": 30 }
+}
+
+model SimulationConnection {
+  id           String   @id @default(cuid())
+  simulationId String
+  simulation   Simulation @relation(fields: [simulationId], references: [id], onDelete: Cascade)
+  fromComponentId String
+  toComponentId   String
+}
+
+// ----------------------------------------------------------------------------
+// Physical devices / remote lab
+// ----------------------------------------------------------------------------
+
+enum DeviceStatus {
+  AVAILABLE
+  RESERVED
+  RUNNING
+  OFFLINE
+  MAINTENANCE
+}
+
+model Device {
+  id              String   @id @default(cuid())
+  deviceId        String   @unique // human-facing id, e.g. "ESP32-001"
+  universityId    String
+  university      University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  labLocation     String?
+  status          DeviceStatus @default(AVAILABLE)
+  firmwareVersion String?
+  lastConnectionAt DateTime?
+
+  createdAt       DateTime @default(now())
+
+  reservations    DeviceReservation[]
+  telemetry       DeviceTelemetry[]
+
+  @@index([universityId])
+  @@index([status])
+}
+
+model DeviceReservation {
+  id          String   @id @default(cuid())
+  deviceId    String
+  device      Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  studentId   String
+  student     User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  startTime   DateTime
+  endTime     DateTime
+  status      ReservationStatus @default(ACTIVE)
+
+  createdAt   DateTime @default(now())
+
+  @@index([deviceId])
+  @@index([studentId])
+}
+
+enum ReservationStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+model DeviceTelemetry {
+  id         String   @id @default(cuid())
+  deviceId   String
+  device     Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  payload    Json     // free-form sensor payload, mirrors MQTT telemetry topic body
+  receivedAt DateTime @default(now())
+
+  @@index([deviceId, receivedAt])
+}
+
+// ----------------------------------------------------------------------------
+// Platform / billing / observability
+// ----------------------------------------------------------------------------
+
+model Subscription {
+  id            String   @id @default(cuid())
+  universityId  String   @unique
+  university    University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  plan          String   // e.g. "trial" | "standard" | "enterprise"
+  seats         Int      @default(50)
+  status        String   @default("active")
+  renewsAt      DateTime?
+  createdAt     DateTime @default(now())
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  universityId String?
+  university   University? @relation(fields: [universityId], references: [id], onDelete: SetNull)
+  userId       String?
+  user         User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action       String
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  @@index([universityId])
+  @@index([userId])
+}
+
+// ----------------------------------------------------------------------------
+// Commerce — buy kits & mail rentals
+// ----------------------------------------------------------------------------
+
+enum ProductType {
+  BUYABLE
+  RENTABLE
+  BOTH
+}
+
+model Product {
+  id             String      @id @default(cuid())
+  slug           String      @unique
+  name           String
+  description    String
+  imageUrl       String?
+  priceCents     Int         // buy price
+  rentPriceCents Int?        // rental fee for the rental period
+  depositCents   Int?        // refundable deposit for rentals
+  rentalDays     Int         @default(14)
+  stock          Int         @default(0)
+  type           ProductType @default(BOTH)
+  active         Boolean     @default(true)
+  courseId       String?
+  course         Course?     @relation(fields: [courseId], references: [id], onDelete: SetNull)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  orderItems     OrderItem[]
+  rentals        Rental[]
+
+  @@index([active])
+  @@index([courseId])
+}
+
+model Address {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label      String?
+  line1      String
+  line2      String?
+  city       String
+  state      String
+  postalCode String
+  country    String   @default("US")
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  orders     Order[]
+
+  @@index([userId])
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FULFILLING
+  SHIPPED
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum OrderKind {
+  BUY
+  RENT
+  MIXED
+}
+
+model Order {
+  id                    String      @id @default(cuid())
+  userId                String
+  user                  User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status                OrderStatus @default(PENDING)
+  kind                  OrderKind
+  shippingAddressId     String?
+  shippingAddress       Address?    @relation(fields: [shippingAddressId], references: [id], onDelete: SetNull)
+  subtotalCents         Int         @default(0)
+  shippingCents         Int         @default(0)
+  depositCents          Int         @default(0)
+  totalCents            Int         @default(0)
+  stripeSessionId       String?     @unique
+  stripePaymentIntentId String?
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  items                 OrderItem[]
+  shipments             Shipment[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum OrderItemKind {
+  BUY
+  RENT
+}
+
+model OrderItem {
+  id             String        @id @default(cuid())
+  orderId        String
+  order          Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product       @relation(fields: [productId], references: [id])
+  kind           OrderItemKind
+  quantity       Int           @default(1)
+  unitPriceCents Int
+  depositCents   Int           @default(0)
+
+  rental         Rental?
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+enum RentalStatus {
+  PAID
+  SHIPPED
+  DELIVERED
+  RETURN_SHIPPED
+  RETURNED
+  COMPLETED
+  OVERDUE
+  CANCELLED
+}
+
+model Rental {
+  id              String       @id @default(cuid())
+  orderItemId     String       @unique
+  orderItem       OrderItem    @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product      @relation(fields: [productId], references: [id])
+  status          RentalStatus @default(PAID)
+  startDate       DateTime?
+  dueDate         DateTime?
+  returnedAt      DateTime?
+  depositCents    Int          @default(0)
+  depositReleased Boolean      @default(false)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  shipments       Shipment[]
+
+  @@index([userId])
+  @@index([productId])
+  @@index([status])
+}
+
+enum ShipmentDirection {
+  OUTBOUND
+  RETURN
+}
+
+model Shipment {
+  id              String            @id @default(cuid())
+  orderId         String?
+  order           Order?            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  rentalId        String?
+  rental          Rental?           @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+  direction       ShipmentDirection
+  carrier         String?
+  trackingNumber  String?
+  shippedAt       DateTime?
+  deliveredAt     DateTime?
+  createdAt       DateTime          @default(now())
+
+  @@index([orderId])
+  @@index([rentalId])
+}
